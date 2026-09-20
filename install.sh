@@ -110,7 +110,7 @@ ${cookie_block}
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -q '\"success\"' || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -Eq '\"success\"[[:space:]]*:[[:space:]]*true' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
@@ -168,7 +168,10 @@ EOF
 }
 
 render_caddyfile() {
-  [[ -z "$DOMAIN" ]] && return 0
+  if [[ -z "$DOMAIN" ]]; then
+    rm -f "$APP_DIR/Caddyfile"
+    return 0
+  fi
   cat >"$APP_DIR/Caddyfile" <<EOF
 ${DOMAIN} {
   encode zstd gzip
@@ -183,12 +186,58 @@ ${DOMAIN} {
 EOF
 }
 
+render_backup_script() {
+  cat >"$APP_DIR/newapi-backup" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+app_dir="${NEWAPI_APP_DIR:-/opt/newapi}"
+backup_dir="$app_dir/backups"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+sql_tmp=""
+files_tmp=""
+paused=0
+
+cleanup() {
+  [[ -z "$sql_tmp" ]] || rm -f "$sql_tmp"
+  [[ -z "$files_tmp" ]] || rm -f "$files_tmp"
+  if (( paused )); then
+    docker unpause new-api >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p "$backup_dir"
+cd "$app_dir"
+sql_tmp="$(mktemp "$backup_dir/.postgres-${stamp}.XXXXXX")"
+files_tmp="$(mktemp "$backup_dir/.files-${stamp}.XXXXXX")"
+
+docker compose exec -T postgres pg_dump -U newapi -d newapi | gzip -9 >"$sql_tmp"
+gzip -t "$sql_tmp"
+mv "$sql_tmp" "$backup_dir/postgres-${stamp}.sql.gz"
+sql_tmp=""
+
+docker pause new-api >/dev/null
+paused=1
+tar -czf "$files_tmp" data logs
+tar -tzf "$files_tmp" >/dev/null
+docker unpause new-api >/dev/null
+paused=0
+mv "$files_tmp" "$backup_dir/files-${stamp}.tar.gz"
+files_tmp=""
+
+find "$backup_dir" -type f -mtime +6 -delete
+EOF
+  chmod 750 "$APP_DIR/newapi-backup"
+}
+
 render_files() {
   validate_domain
   install -d -m 0750 "$APP_DIR" "$APP_DIR/data" "$APP_DIR/logs" "$APP_DIR/backups"
   render_env
   render_compose
   render_caddyfile
+  render_backup_script
 }
 
 install_docker() {
@@ -237,19 +286,7 @@ configure_host_security() {
 }
 
 install_backup_timer() {
-  cat >/usr/local/sbin/newapi-backup <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-app_dir=/opt/newapi
-backup_dir="$app_dir/backups"
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$backup_dir"
-cd "$app_dir"
-docker compose exec -T postgres pg_dump -U newapi -d newapi | gzip -9 >"$backup_dir/postgres-${stamp}.sql.gz"
-tar -czf "$backup_dir/files-${stamp}.tar.gz" data logs
-find "$backup_dir" -type f -mtime +7 -delete
-EOF
-  chmod 750 /usr/local/sbin/newapi-backup
+  install -m 0750 "$APP_DIR/newapi-backup" /usr/local/sbin/newapi-backup
 
   cat >/etc/systemd/system/newapi-backup.service <<'EOF'
 [Unit]
@@ -286,6 +323,7 @@ main() {
   fi
 
   [[ "${EUID}" -eq 0 ]] || die "Run this installer as root"
+  [[ -z "${OUTPUT_DIR:-}" || "$APP_DIR" == "/opt/newapi" ]] || die "OUTPUT_DIR is supported only with --render-only"
   [[ -r /etc/os-release ]] || die "Cannot identify this operating system"
   . /etc/os-release
   [[ "$ID" == "ubuntu" ]] || die "This installer supports Ubuntu only"
